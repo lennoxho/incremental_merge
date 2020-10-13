@@ -232,7 +232,6 @@ def merge_images(index, video_info, work_directory, begin, end, segment_filename
     temp_filename = work_directory / TEMP_SEGMENT_FILENAME
     output_args = [str(temp_filename)]
 
-    # TODO: Progress bar using -progress pipe:1
     if video_info["frame_rate_mode"] == "CFR":
         frame_rate = video_info["frame_rate"]
         frame_rate_args = ["-framerate", str(frame_rate)]

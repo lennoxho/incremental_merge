@@ -1,3 +1,5 @@
+# Simple script to incrementally create video from PNGs
+
 import argparse
 import copy
 import hashlib
@@ -8,6 +10,7 @@ import json
 from pymediainfo import MediaInfo
 from pathlib import Path
 from tqdm import tqdm, trange
+from PIL import Image
 
 CONFIG_FILENAME = "config.json"
 
@@ -17,11 +20,13 @@ DURATION_PREFIX = "frame,"
 RACE_SAFETY_WAIT_SECONDS = 3
 
 TEMP_SEGMENT_FILENAME = "segment_temp.mp4"
+TEMP_MASTER_FILENAME = "master_temp.mp4"
 SEGMENT_FILENAME_FORMAT = "segment_%d.mp4"
 UPSCALED_IMAGE_FILENAME_PATTERN = "%06d.png"
 
 FFMPEG = "ffmpeg"
 MERGE_IMAGES_CFR_ARGS = ["-y", "-hide_banner", "-loglevel", "error", "-c:v", "libx264", "-preset", "slow", "-crf", "17", "-x264-params", "keyint=15:scenecut=0", "-pix_fmt", "yuv420p", "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"]
+UNSAFE_MERGE_ARGS = ["-safe", "0"]
 MERGE_IMAGES_VFR_ARGS = ["-y", "-hide_banner", "-loglevel", "error", "-c:v", "libx264", "-preset", "slow", "-crf", "17", "-x264-params", "keyint=15:scenecut=0", "-pix_fmt", "yuv420p", "-vsync", "2", "-r", "120", "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"]
 MUX_ARGS = ["-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0"]
 MUX_FILTER_ARGS = ["-c", "copy", "-map", "0:0", "-map", "1:1"]
@@ -77,10 +82,13 @@ class Arguments:
         if not self.__args.resume:
             self.__args.input_filename = Path(self.__args.input_filename).absolute()
             assert self.__args.input_filename.exists(), self.__args.input_filename
+            assert self.__args.input_filename.suffix == ".mp4"
 
             self.__args.work_directory.mkdir(exist_ok=True)
 
             self.__args.output_filename = Path(self.__args.output_filename).absolute()
+
+            assert self.__args.input_filename != self.__args.output_filename
 
             assert self.__args.start_index >= 0
             assert self.__args.batch_size > 0
@@ -134,7 +142,7 @@ def verify_config(args_obj):
         else:
             prev_config = read_config(config_filename)
             assert prev_config.keys() == current_config.keys(), current_config.keys()
-            assert prev_config == current_config, current_config
+            assert prev_config == current_config, [prev_config, current_config]
 
     return args
 
@@ -199,17 +207,27 @@ def generate_segment_concat_file(files, durations, concat_filename):
 
         for i in range(len(files)):
             filename = files[i]
-            hfile.write(CONCAT_FILE_ENTRY_PREFIX + "'" + filename + "'\n")
+            hfile.write(CONCAT_FILE_ENTRY_PREFIX + "'" + str(filename) + "'\n")
 
             duration = durations[i]
             hfile.write(CONCAT_DURATION_PREFIX + str(duration) + "\n")
 
-        hfile.write(CONCAT_FILE_ENTRY_PREFIX + files[-1])
+        hfile.write(CONCAT_FILE_ENTRY_PREFIX + "'" + str(files[-1]) + "'")
 
-def merge_images(video_info, work_directory, begin, end, segment_filename, durations):
+def image_size(filename):
+    im = Image.open(str(filename))
+    width, height = im.size
+    im.close()
+    return (width, height)
+
+def merge_images(index, video_info, work_directory, begin, end, segment_filename, durations):
+    assert begin <= end
+
     filenames = [work_directory / (UPSCALED_IMAGE_FILENAME_PATTERN % i) for i in range(begin, end+1)]
     for file in filenames:
         assert file.exists(), str(file)
+
+    assert image_size(filenames[0]) == image_size(filenames[-1])
 
     temp_filename = work_directory / TEMP_SEGMENT_FILENAME
     output_args = [str(temp_filename)]
@@ -226,12 +244,12 @@ def merge_images(video_info, work_directory, begin, end, segment_filename, durat
         cmd = [FFMPEG] + frame_rate_args + input_args + MERGE_IMAGES_CFR_ARGS + output_args
         ffmpeg_track_progress(cmd, frame_count, "Writing \"%s\"" % segment_filename.name)
     else:
-        concat_filename = work_directory / (CONCAT_FILENAME_FORMAT % i)
+        concat_filename = work_directory / (CONCAT_FILENAME_FORMAT % index)
         generate_segment_concat_file(filenames, durations, concat_filename)
 
         input_args = ["-i", str(concat_filename)]
 
-        cmd = [FFMPEG] + input_args + MERGE_IMAGES_VFR_ARGS + output_args
+        cmd = [FFMPEG] + UNSAFE_MERGE_ARGS + input_args + MERGE_IMAGES_VFR_ARGS + output_args
         ffmpeg_track_progress(cmd, len(durations), "Writing \"%s\"" % segment_filename.name)
 
     temp_filename.rename(segment_filename)
@@ -267,7 +285,7 @@ def merge_images_loop(video_info, args, durations):
 
                 end_filename = args.work_directory / (UPSCALED_IMAGE_FILENAME_PATTERN % end)
                 wait(end_filename, t)
-                merge_images(video_info, args.work_directory, begin, end, segment_filename, segment_durations)
+                merge_images(i, video_info, args.work_directory, begin, end, segment_filename, segment_durations)
 
             # To force tqdm to update. Turns out tqdm is polling based :/
             time.sleep(0.1)
@@ -288,11 +306,18 @@ def merge_segments(args, video_info, segments):
         for segment in segments:
             hfile.write(CONCAT_FILE_ENTRY_PREFIX + "'" + str(segment) + "'\n")
 
+    temp_filename = args.work_directory / TEMP_MASTER_FILENAME
+
     input_args = ["-i", str(concat_filename), "-i", str(args.input_filename)]
-    output_args = [str(args.output_filename)]
+    output_args = [str(temp_filename)]
 
     cmd = [FFMPEG] + MUX_ARGS + input_args + MUX_FILTER_ARGS + output_args
     ffmpeg_track_progress(cmd, int(video_info["frame_count"]), "Progress")
+
+    temp_filename.rename(args.output_filename)
+
+    for segment in tqdm(segments, desc="Deleting segments"):
+        segment.unlink()
 
 if __name__ == "__main__":
     args_obj = Arguments()

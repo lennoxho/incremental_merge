@@ -19,9 +19,9 @@ DURATION_PREFIX = "frame,"
 
 RACE_SAFETY_WAIT_SECONDS = 3
 
-TEMP_SEGMENT_FILENAME = "segment_temp.mp4"
-TEMP_MASTER_FILENAME = "master_temp.mp4"
-SEGMENT_FILENAME_FORMAT = "segment_%d.mp4"
+TEMP_SEGMENT_FILENAME = "segment_temp.mkv"
+TEMP_MASTER_FILENAME = "master_temp.mkv"
+SEGMENT_FILENAME_FORMAT = "segment_%d.mkv"
 UPSCALED_IMAGE_FILENAME_PATTERN = "%06d.png"
 
 FFMPEG = "ffmpeg"
@@ -56,6 +56,7 @@ class Arguments:
         # 1 minutes of 30fps video, or 30 seconds of 60 fps video
         parser.add_argument('-n', "--batch_size", type=int, default=1800, action="store", required=False)
         parser.add_argument('-p', "--poll_time", type=int, default=60, action="store", required=False)
+        parser.add_argument('-f', "--override_frame_count", type=int, action="store", required=False)
 
         self.__args = parser.parse_args()
 
@@ -82,17 +83,22 @@ class Arguments:
         if not self.__args.resume:
             self.__args.input_filename = Path(self.__args.input_filename).absolute()
             assert self.__args.input_filename.exists(), self.__args.input_filename
-            assert self.__args.input_filename.suffix == ".mp4"
+            assert self.__args.input_filename.suffix in [".mp4", ".mkv"]
 
             self.__args.work_directory.mkdir(exist_ok=True)
 
             self.__args.output_filename = Path(self.__args.output_filename).absolute()
+            # ffmpeg concat demuxer is buggy with .mp4 format
+            assert self.__args.output_filename.suffix in [".mkv"]
 
             assert self.__args.input_filename != self.__args.output_filename
 
             assert self.__args.start_index >= 0
             assert self.__args.batch_size > 0
             assert self.__args.poll_time >= 0
+
+            if self.__args.override_frame_count is not None:
+                assert self.__args.override_frame_count > 0
 
             self.__args.md5 = self._infile_md5sum()
         else:
@@ -166,16 +172,21 @@ def get_durations(input_filename):
     return_code = proc.wait()
     return durations
 
-def verify_input_and_get_durations(input_info, input_filename):
+def get_frame_count(video_info, override_frame_count):
+    if override_frame_count is not None:
+        return override_frame_count
+    return int(video_info["frame_count"])
+
+def verify_input_and_get_durations(input_info, args):
     assert len(input_info["tracks"]) == 3
     assert input_info["tracks"][VIDEO_STREAM_INDEX]["track_type"] == 'Video'
     assert input_info["tracks"][AUDIO_STREAM_INDEX]["track_type"] == 'Audio'
 
     video_info = input_info["tracks"][VIDEO_STREAM_INDEX]
 
-    frame_count = int(video_info["frame_count"])
+    frame_count = get_frame_count(video_info, args.override_frame_count)
     if video_info["frame_rate_mode"] != "CFR":
-        durations = get_durations(input_filename)
+        durations = get_durations(args.input_filename)
         assert frame_count == len(durations), [frame_count, durations]
         return durations
     else:
@@ -265,7 +276,7 @@ def merge_images_loop(video_info, args, durations):
         # The file might be in the middle of being written to
         time.sleep(RACE_SAFETY_WAIT_SECONDS)
 
-    frame_count = int(video_info["frame_count"])
+    frame_count = get_frame_count(video_info, args.override_frame_count)
     num_segments = frame_count // args.batch_size
 
     segments = []
@@ -290,6 +301,8 @@ def merge_images_loop(video_info, args, durations):
             time.sleep(0.1)
             segments.append(segment_filename)
 
+        t.set_description("Finalising...")
+
     # Sanity check
     time.sleep(RACE_SAFETY_WAIT_SECONDS)
     past_the_end = args.work_directory / (UPSCALED_IMAGE_FILENAME_PATTERN % (args.start_index + frame_count))
@@ -297,7 +310,7 @@ def merge_images_loop(video_info, args, durations):
 
     return segments
 
-def merge_segments(args, video_info, segments):
+def merge_segments(args, video_info, segments, override_frame_count):
     concat_filename = args.work_directory / MASTER_CONCAT_FILENAME
     with open(str(concat_filename), 'w') as hfile:
         hfile.write(CONCAT_HEADER + "\n")
@@ -311,12 +324,12 @@ def merge_segments(args, video_info, segments):
     output_args = [str(temp_filename)]
 
     cmd = [FFMPEG] + MUX_ARGS + input_args + MUX_FILTER_ARGS + output_args
-    ffmpeg_track_progress(cmd, int(video_info["frame_count"]), "Progress")
+    ffmpeg_track_progress(cmd, get_frame_count(video_info, override_frame_count), "Progress")
 
     temp_filename.rename(args.output_filename)
 
-    for segment in tqdm(segments, desc="Deleting segments"):
-        segment.unlink()
+    #for segment in tqdm(segments, desc="Deleting segments"):
+    #    segment.unlink()
 
 if __name__ == "__main__":
     args_obj = Arguments()
@@ -326,7 +339,7 @@ if __name__ == "__main__":
 
     log("Extracing input video metadata...")
     input_info = MediaInfo.parse(str(args.input_filename)).to_data()
-    durations = verify_input_and_get_durations(input_info, args.input_filename)
+    durations = verify_input_and_get_durations(input_info, args)
 
     video_info = input_info["tracks"][VIDEO_STREAM_INDEX]
 
@@ -334,4 +347,4 @@ if __name__ == "__main__":
     segments = merge_images_loop(video_info, args, durations)
 
     log("Merging segments into final video: \"%s\"" % str(args.output_filename))
-    merge_segments(args, video_info, segments)
+    merge_segments(args, video_info, segments, args.override_frame_count)

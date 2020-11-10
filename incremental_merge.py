@@ -30,6 +30,7 @@ UNSAFE_MERGE_ARGS = ["-safe", "0"]
 MERGE_IMAGES_VFR_ARGS = ["-y", "-hide_banner", "-loglevel", "error", "-c:v", "libx264", "-preset", "slow", "-crf", "17", "-x264-params", "keyint=15:scenecut=0", "-pix_fmt", "yuv420p", "-vsync", "2", "-r", "120", "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"]
 MUX_ARGS = ["-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0"]
 MUX_FILTER_ARGS = ["-c", "copy", "-map", "0:0", "-map", "1:1"]
+LAST_FRAME_DURATION = 0.008
 
 CONCAT_FILENAME_FORMAT = "concat_%d.txt"
 MASTER_CONCAT_FILENAME = "master_concat.txt"
@@ -152,42 +153,41 @@ def verify_config(args_obj):
 
     return args
 
-def get_durations(input_filename):
-    cmd = EXTRACT_DURATION_CMD + [str(input_filename)]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True)
-
-    durations = []
-    for line in iter(proc.stdout.readline, ""):
-        line = line.strip()
-        if line == "": continue
-
-        assert line.startswith(DURATION_PREFIX), line
-
-        tokens = line.split(",")
-        assert len(tokens) == 2, tokens
-
-        durations.append(float(tokens[1]))
-
-    proc.stdout.close()
-    return_code = proc.wait()
-    return durations
-
 def get_frame_count(video_info, override_frame_count):
     if override_frame_count is not None:
         return override_frame_count
     return int(video_info["frame_count"])
 
 def verify_input_and_get_durations(input_info, args):
+    def get_frame_durations(input_filename):
+        cmd = EXTRACT_DURATION_CMD + [str(input_filename)]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True)
+
+        durations = []
+        for line in iter(proc.stdout.readline, ""):
+            line = line.strip()
+            if line == "": continue
+
+            assert line.startswith(DURATION_PREFIX), line
+
+            tokens = line.split(",")
+            assert len(tokens) == 2, tokens
+
+            durations.append(float(tokens[1]))
+
+        proc.stdout.close()
+        return_code = proc.wait()
+        return durations
+
     assert len(input_info["tracks"]) == 3
     assert input_info["tracks"][VIDEO_STREAM_INDEX]["track_type"] == 'Video'
     assert input_info["tracks"][AUDIO_STREAM_INDEX]["track_type"] == 'Audio'
-
     video_info = input_info["tracks"][VIDEO_STREAM_INDEX]
 
     frame_count = get_frame_count(video_info, args.override_frame_count)
     if video_info["frame_rate_mode"] != "CFR":
-        durations = get_durations(args.input_filename)
-        assert frame_count == len(durations), [frame_count, durations]
+        durations = get_frame_durations(args.input_filename)
+        assert frame_count <= len(durations), [frame_count, len(durations)]
         return durations
     else:
         return None
@@ -221,6 +221,8 @@ def generate_segment_concat_file(files, durations, concat_filename):
             hfile.write(CONCAT_FILE_ENTRY_PREFIX + "'" + str(filename) + "'\n")
 
             duration = durations[i]
+            if i+1 == len(files):
+                duration -= LAST_FRAME_DURATION
             hfile.write(CONCAT_DURATION_PREFIX + str(duration) + "\n")
 
         hfile.write(CONCAT_FILE_ENTRY_PREFIX + "'" + str(files[-1]) + "'")
@@ -278,6 +280,8 @@ def merge_images_loop(video_info, args, durations):
 
     frame_count = get_frame_count(video_info, args.override_frame_count)
     num_segments = frame_count // args.batch_size
+    if num_segments == 0:
+        num_segments = 1
 
     segments = []
     with trange(num_segments) as t:
@@ -311,6 +315,19 @@ def merge_images_loop(video_info, args, durations):
     return segments
 
 def merge_segments(args, video_info, segments, override_frame_count):
+    frame_count = get_frame_count(video_info, override_frame_count)
+
+    # Sanity check
+    actual_frame_count = 0
+    for segment in segments:
+        segment_info = MediaInfo.parse(str(segment)).to_data()
+
+        assert len(segment_info["tracks"]) == 2
+        assert segment_info["tracks"][VIDEO_STREAM_INDEX]["track_type"] == 'Video'
+
+        actual_frame_count += int(segment_info["tracks"][VIDEO_STREAM_INDEX]["frame_count"])
+    assert actual_frame_count == frame_count, [actual_frame_count, frame_count]
+
     concat_filename = args.work_directory / MASTER_CONCAT_FILENAME
     with open(str(concat_filename), 'w') as hfile:
         hfile.write(CONCAT_HEADER + "\n")
@@ -324,12 +341,9 @@ def merge_segments(args, video_info, segments, override_frame_count):
     output_args = [str(temp_filename)]
 
     cmd = [FFMPEG] + MUX_ARGS + input_args + MUX_FILTER_ARGS + output_args
-    ffmpeg_track_progress(cmd, get_frame_count(video_info, override_frame_count), "Progress")
+    ffmpeg_track_progress(cmd, frame_count, "Progress")
 
     temp_filename.rename(args.output_filename)
-
-    #for segment in tqdm(segments, desc="Deleting segments"):
-    #    segment.unlink()
 
 if __name__ == "__main__":
     args_obj = Arguments()
@@ -342,6 +356,7 @@ if __name__ == "__main__":
     durations = verify_input_and_get_durations(input_info, args)
 
     video_info = input_info["tracks"][VIDEO_STREAM_INDEX]
+    log("Number of frames: %d" % get_frame_count(video_info, args.override_frame_count))
 
     log("\nCreating segments...")
     segments = merge_images_loop(video_info, args, durations)
